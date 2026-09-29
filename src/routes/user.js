@@ -15,10 +15,4 @@ router.put(
   indexController.updateUserInfo,
 );
 
-router.put(
-  "/user/profile",
-  passport.authenticate("jwt", { session: false }),
-  indexController.updateProfile,
-);
-
 module.exports = router;

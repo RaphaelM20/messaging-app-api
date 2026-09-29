@@ -1,22 +1,93 @@
 const { body, validationResult, matchedData } = require("express-validator");
 const bcrypt = require("bcryptjs");
-const passport = require("passport");
 const prisma = require("../../db/prisma");
 const jwt = require("jsonwebtoken");
-const { json } = require("express");
 
-const validateSignUp = [
-  body("name").trim().isAlpha(),
-  body("email")
+// Includes the current user.
+const MAX_GROUP_MEMBERS = 10;
+const MAX_MESSAGE_LENGTH = 2000;
+const MAX_SEARCH_RESULTS = 20;
+
+// Never select the password hash into a response.
+const PUBLIC_USER_FIELDS = {
+  id: true,
+  name: true,
+  username: true,
+  picture: true,
+  bio: true,
+};
+const MEMBER_FIELDS = { id: true, name: true, picture: true };
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Errors use the same shape as express-validator's: { errors: [{ msg }] }.
+function sendError(res, status, msg) {
+  return res.status(status).json({ errors: [{ msg }] });
+}
+
+function parseId(value) {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function handleValidation(req, res, next) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  next();
+}
+
+// Resolves only conversations the user belongs to. Callers answer 404 for
+// both "missing" and "not yours" so IDs can't be probed.
+function findMemberConversation(conversationId, userId, options = {}) {
+  return prisma.conversation.findFirst({
+    where: { id: conversationId, members: { some: { id: userId } } },
+    ...options,
+  });
+}
+
+function signToken(userId) {
+  return jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: "1d" });
+}
+
+function isUniqueViolation(err) {
+  return err?.code === "P2002";
+}
+
+// ---------------------------------------------------------------------------
+// Validation rules
+// ---------------------------------------------------------------------------
+
+const nameRule = () =>
+  body("name")
     .trim()
-    .isEmail()
-    .withMessage("Please enter a valid email address"),
+    .notEmpty()
+    .withMessage("Name is required")
+    .isLength({ max: 50 })
+    .withMessage("Name must be 50 characters or fewer")
+    .matches(/^[\p{L}\p{M}' -]+$/u)
+    .withMessage(
+      "Name may only contain letters, spaces, hyphens and apostrophes",
+    );
+
+const usernameRule = () =>
   body("username")
     .trim()
     .matches(/^[a-zA-Z0-9 ]+$/)
     .withMessage("Please include only letters, numbers, and spaces")
     .isLength({ min: 4, max: 20 })
-    .withMessage("Username must be between 4 and 20 characters"),
+    .withMessage("Username must be between 4 and 20 characters");
+
+const validateSignUp = [
+  nameRule(),
+  body("email")
+    .trim()
+    .isEmail()
+    .withMessage("Please enter a valid email address"),
+  usernameRule(),
   body("password")
     .trim()
     .isLength({ min: 6, max: 20 })
@@ -29,212 +100,244 @@ const validateSignUp = [
       }
       return true;
     }),
+  handleValidation,
 ];
+
+const validateProfile = [
+  nameRule(),
+  usernameRule(),
+  body("bio")
+    .optional({ values: "null" })
+    .isString()
+    .trim()
+    .isLength({ max: 190 })
+    .withMessage("Bio must be 190 characters or fewer"),
+  body("picture")
+    .optional({ values: "falsy" })
+    .trim()
+    .isURL({ protocols: ["http", "https"], require_protocol: true })
+    .withMessage("Picture must be an http(s) URL"),
+  handleValidation,
+];
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
 
 const signUpPost = [
   validateSignUp,
-  async (req, res, next) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        errors: errors.array(),
-        data: req.body,
-      });
-    }
-
+  async (req, res) => {
     const { name, email, username, password } = matchedData(req);
-    const hashedPassword = await bcrypt.hash(password, 10);
 
-    const existingEmail = await prisma.user.findUnique({
-      where: { email: email },
-    });
-
-    const existingUsername = await prisma.user.findUnique({
-      where: { username: username },
-    });
-
-    if (existingEmail) {
-      return res.status(400).json({
-        errors: [{ message: "Email already in use" }],
-        data: req.body,
-      });
-    } else if (existingUsername) {
-      return res.status(400).json({
-        errors: [{ message: "Username already in use" }],
-        data: req.body,
-      });
-    }
+    const [existingEmail, existingUsername] = await Promise.all([
+      prisma.user.findUnique({ where: { email } }),
+      prisma.user.findUnique({ where: { username } }),
+    ]);
+    if (existingEmail) return sendError(res, 400, "Email already in use");
+    if (existingUsername) return sendError(res, 400, "Username already in use");
 
     const newUser = await prisma.user.create({
       data: {
-        name: name,
-        email: email,
-        username: username,
-        password: hashedPassword,
+        name,
+        email,
+        username,
+        password: await bcrypt.hash(password, 10),
         picture:
           "https://res.cloudinary.com/zrc0epiv/image/upload/v1786553336/no-pfp_snavwl.jpg",
       },
     });
 
-    const token = jwt.sign({ id: newUser.id }, process.env.JWT_SECRET, {
-      expiresIn: "1d",
-    });
-
-    return res.status(201).json({ token: token });
+    return res.status(201).json({ token: signToken(newUser.id) });
   },
 ];
 
 async function loginPost(req, res) {
-  const token = jwt.sign({ id: req.user.id }, process.env.JWT_SECRET, {
-    expiresIn: "1d",
-  });
-  return res.json({ token: token });
+  return res.json({ token: signToken(req.user.id) });
 }
 
-async function createMessage(req, res) {
-  const message = await prisma.message.create({
-    data: {
-      senderId: req.user.id,
-      conversationId: parseInt(req.params.conversationId),
-      content: req.body.content,
-    },
-  });
-
-  await prisma.conversation.update({
-    where: { id: parseInt(req.params.conversationId) },
-    data: { lastActivity: new Date() },
-  });
-  return res.json(message);
-}
-
-async function createConversation(req, res) {
-  const memberChecks = req.body.members.map((id) => ({
-    members: { some: { id } },
-  }));
-
-  const existing = await prisma.conversation.findFirst({
-    where: {
-      AND: [
-        { members: { some: { id: req.user.id } } },
-        ...memberChecks,
-        {
-          members: {
-            every: { id: { in: [req.user.id, ...req.body.members] } },
-          },
-        },
-      ],
-    },
-  });
-
-  if (existing) return res.json(existing);
-
-  const conversation = await prisma.conversation.create({
-    data: {
-      members: {
-        connect: [
-          { id: req.user.id },
-          ...req.body.members.map((id) => ({ id })),
-        ],
-      },
-    },
-  });
-  return res.json(conversation);
-}
+// ---------------------------------------------------------------------------
+// Conversations and messages
+// ---------------------------------------------------------------------------
 
 async function getAllConversations(req, res) {
-  const allConversations = await prisma.conversation.findMany({
-    where: {
-      members: {
-        some: {
-          id: req.user.id,
-        },
-      },
-    },
+  const conversations = await prisma.conversation.findMany({
+    where: { members: { some: { id: req.user.id } } },
     include: {
-      members: {
-        select: {
-          id: true,
-          name: true,
-          picture: true,
-        },
-      },
+      members: { select: MEMBER_FIELDS },
       messages: {
-        select: {
-          content: true,
-          createdAt: true,
-        },
+        select: { content: true, createdAt: true },
         orderBy: { createdAt: "desc" },
         take: 1,
       },
     },
     orderBy: { lastActivity: "desc" },
   });
-  return res.json(allConversations);
+  return res.json(conversations);
 }
 
 async function getOneConversation(req, res) {
-  const conversation = await prisma.conversation.findUnique({
-    where: {
-      id: parseInt(req.params.conversationId),
-    },
-    include: {
-      members: {
-        select: {
-          id: true,
-          name: true,
-          picture: true,
-        },
-      },
-      messages: {
-        select: {
-          id: true,
-          content: true,
-          createdAt: true,
-          sender: {
-            select: {
-              id: true,
-              name: true,
-              picture: true,
-            },
+  const conversationId = parseId(req.params.conversationId);
+  const conversation =
+    conversationId &&
+    (await findMemberConversation(conversationId, req.user.id, {
+      include: {
+        members: { select: MEMBER_FIELDS },
+        messages: {
+          select: {
+            id: true,
+            content: true,
+            createdAt: true,
+            sender: { select: MEMBER_FIELDS },
           },
+          orderBy: { createdAt: "asc" },
         },
-        orderBy: { createdAt: "asc" },
       },
+    }));
+
+  if (!conversation) return sendError(res, 404, "Conversation not found");
+  return res.json(conversation);
+}
+
+async function createConversation(req, res) {
+  const { members } = req.body;
+  if (!Array.isArray(members)) {
+    return sendError(res, 400, "members must be an array of user IDs");
+  }
+
+  const parsedIds = members.map(parseId);
+  if (parsedIds.includes(null)) {
+    return sendError(res, 400, "members must be an array of user IDs");
+  }
+  // Ignore duplicates and the current user, who is always a member.
+  const memberIds = [...new Set(parsedIds)].filter((id) => id !== req.user.id);
+  if (memberIds.length === 0) {
+    return sendError(res, 400, "Choose at least one other member");
+  }
+  if (memberIds.length > MAX_GROUP_MEMBERS - 1) {
+    return sendError(
+      res,
+      400,
+      `Groups can have up to ${MAX_GROUP_MEMBERS} members`,
+    );
+  }
+
+  const found = await prisma.user.count({ where: { id: { in: memberIds } } });
+  if (found !== memberIds.length) {
+    return sendError(res, 400, "One or more members don't exist");
+  }
+
+  // Reuse the conversation with exactly these members if it exists.
+  const allMemberIds = [req.user.id, ...memberIds];
+  const existing = await prisma.conversation.findFirst({
+    where: {
+      AND: [
+        ...allMemberIds.map((id) => ({ members: { some: { id } } })),
+        { members: { every: { id: { in: allMemberIds } } } },
+      ],
     },
   });
-  return res.json(conversation);
+  if (existing) return res.json(existing);
+
+  const conversation = await prisma.conversation.create({
+    data: { members: { connect: allMemberIds.map((id) => ({ id })) } },
+  });
+  return res.status(201).json(conversation);
 }
 
 async function addToConversation(req, res) {
-  const conversation = await prisma.conversation.update({
-    where: {
-      id: parseInt(req.params.conversationId),
-    },
+  const conversationId = parseId(req.params.conversationId);
+  const recipientId = parseId(req.body.recipientId);
+  if (!recipientId) return sendError(res, 400, "recipientId is required");
+
+  const conversation =
+    conversationId &&
+    (await findMemberConversation(conversationId, req.user.id, {
+      include: { _count: { select: { members: true } } },
+    }));
+  if (!conversation) return sendError(res, 404, "Conversation not found");
+  if (conversation._count.members >= MAX_GROUP_MEMBERS) {
+    return sendError(
+      res,
+      400,
+      `Groups can have up to ${MAX_GROUP_MEMBERS} members`,
+    );
+  }
+
+  const recipient = await prisma.user.findUnique({
+    where: { id: recipientId },
+    select: { id: true },
+  });
+  if (!recipient) return sendError(res, 404, "User not found");
+
+  const updated = await prisma.conversation.update({
+    where: { id: conversationId },
     data: {
-      members: {
-        connect: [{ id: req.body.recipientId }],
-      },
+      members: { connect: [{ id: recipientId }] },
+      lastActivity: new Date(),
     },
   });
-
-  await prisma.conversation.update({
-    where: { id: parseInt(req.params.conversationId) },
-    data: { lastActivity: new Date() },
-  });
-  return res.json(conversation);
+  return res.json(updated);
 }
 
-async function removeFromConversation(req, res) {
-  const conversation = await prisma.conversation.update({
-    where: {
-      members: {
-        disconnect: [{ id: req.user.id }],
+async function createMessage(req, res) {
+  const conversationId = parseId(req.params.conversationId);
+  const content =
+    typeof req.body.content === "string" ? req.body.content.trim() : "";
+
+  if (!content) return sendError(res, 400, "Message can't be empty");
+  if (content.length > MAX_MESSAGE_LENGTH) {
+    return sendError(
+      res,
+      400,
+      `Messages can be at most ${MAX_MESSAGE_LENGTH} characters`,
+    );
+  }
+
+  const conversation =
+    conversationId &&
+    (await findMemberConversation(conversationId, req.user.id));
+  if (!conversation) return sendError(res, 404, "Conversation not found");
+
+  const [message] = await prisma.$transaction([
+    prisma.message.create({
+      data: { senderId: req.user.id, conversationId, content },
+    }),
+    prisma.conversation.update({
+      where: { id: conversationId },
+      data: { lastActivity: new Date() },
+    }),
+  ]);
+  return res.status(201).json(message);
+}
+
+async function deleteMessage(req, res) {
+  const conversationId = parseId(req.params.conversationId);
+  const messageId = parseId(req.params.messageId);
+
+  const message =
+    conversationId &&
+    messageId &&
+    (await prisma.message.findFirst({
+      where: {
+        id: messageId,
+        conversationId,
+        conversation: { members: { some: { id: req.user.id } } },
       },
-    },
-  });
+      select: { senderId: true },
+    }));
 
-  return res.json(conversation);
+  if (!message) return sendError(res, 404, "Message not found");
+  if (message.senderId !== req.user.id) {
+    return sendError(res, 403, "You can only delete your own messages");
+  }
+
+  await prisma.message.delete({ where: { id: messageId } });
+  return res.status(204).end();
 }
+
+// ---------------------------------------------------------------------------
+// Friends
+// ---------------------------------------------------------------------------
 
 async function getFriends(req, res) {
   const friends = await prisma.friend.findMany({
@@ -243,9 +346,7 @@ async function getFriends(req, res) {
       status: "ACCEPTED",
     },
     include: {
-      user: {
-        select: { id: true, name: true, picture: true, username: true },
-      },
+      user: { select: { id: true, name: true, picture: true, username: true } },
       buddy: {
         select: { id: true, name: true, picture: true, username: true },
       },
@@ -255,87 +356,100 @@ async function getFriends(req, res) {
 }
 
 async function getPendingRequests(req, res) {
-  const received = await prisma.friend.findMany({
-    where: {
-      buddyId: req.user.id,
-      status: "PENDING",
-    },
-    include: {
-      user: {
-        select: {
-          id: true,
-          name: true,
-          picture: true,
-          username: true,
-        },
-      },
-    },
-  });
-
-  const sent = await prisma.friend.findMany({
-    where: {
-      userId: req.user.id,
-      status: "PENDING",
-    },
-    include: {
-      buddy: {
-        select: {
-          id: true,
-          name: true,
-          picture: true,
-          username: true,
-        },
-      },
-    },
-  });
+  const personFields = { id: true, name: true, picture: true, username: true };
+  const [received, sent] = await Promise.all([
+    prisma.friend.findMany({
+      where: { buddyId: req.user.id, status: "PENDING" },
+      include: { user: { select: personFields } },
+    }),
+    prisma.friend.findMany({
+      where: { userId: req.user.id, status: "PENDING" },
+      include: { buddy: { select: personFields } },
+    }),
+  ]);
   return res.json({ received, sent });
 }
 
 async function sendFriendRequest(req, res) {
-  console.log("body:", req.body);
-  try {
-    const request = await prisma.friend.create({
-      data: {
-        userId: req.user.id,
-        buddyId: req.body.buddyId,
-        status: "PENDING",
-      },
-    });
-    return res.json(request);
-  } catch (err) {
-    console.log("error:", err);
-    return res.status(500).json({ error: err.message });
+  const buddyId = parseId(req.body.buddyId);
+  if (!buddyId) return sendError(res, 400, "buddyId is required");
+  if (buddyId === req.user.id) {
+    return sendError(res, 400, "You can't add yourself as a friend");
   }
-}
 
-async function acceptFriendRequest(req, res) {
-  const request = await prisma.friend.update({
+  const buddy = await prisma.user.findUnique({
+    where: { id: buddyId },
+    select: { id: true },
+  });
+  if (!buddy) return sendError(res, 404, "User not found");
+
+  const existing = await prisma.friend.findFirst({
     where: {
-      id: parseInt(req.params.id),
-    },
-    data: {
-      status: "ACCEPTED",
+      OR: [
+        { userId: req.user.id, buddyId },
+        { userId: buddyId, buddyId: req.user.id },
+      ],
     },
   });
+  if (existing) {
+    return sendError(
+      res,
+      409,
+      existing.status === "ACCEPTED"
+        ? "You're already friends"
+        : "A friend request between you already exists",
+    );
+  }
+
+  const request = await prisma.friend.create({
+    data: { userId: req.user.id, buddyId, status: "PENDING" },
+  });
+  return res.status(201).json(request);
+}
+
+// Only the recipient of a pending request can accept it.
+async function acceptFriendRequest(req, res) {
+  const id = parseId(req.params.id);
+  const { count } = id
+    ? await prisma.friend.updateMany({
+        where: { id, buddyId: req.user.id, status: "PENDING" },
+        data: { status: "ACCEPTED" },
+      })
+    : { count: 0 };
+
+  if (count === 0) return sendError(res, 404, "Friend request not found");
+  const request = await prisma.friend.findUnique({ where: { id } });
   return res.json(request);
 }
 
+// Either side can remove a friendship or withdraw/decline a request.
 async function removeFriend(req, res) {
-  console.log("id:", req.params.id);
-  const remove = await prisma.friend.delete({
-    where: { id: parseInt(req.params.id) },
-  });
+  const id = parseId(req.params.id);
+  const { count } = id
+    ? await prisma.friend.deleteMany({
+        where: {
+          id,
+          OR: [{ userId: req.user.id }, { buddyId: req.user.id }],
+        },
+      })
+    : { count: 0 };
 
-  return res.json(remove);
+  if (count === 0) return sendError(res, 404, "Friendship not found");
+  return res.status(204).end();
 }
 
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
 async function searchUsers(req, res) {
+  const search =
+    typeof req.query.search === "string" ? req.query.search.trim() : "";
+  if (!search || search.length > 20) return res.json([]);
+
   const users = await prisma.user.findMany({
     where: {
-      username: {
-        contains: req.query.search,
-        mode: "insensitive",
-      },
+      username: { contains: search, mode: "insensitive" },
       NOT: { id: req.user.id },
     },
     select: {
@@ -352,64 +466,59 @@ async function searchUsers(req, res) {
         select: { status: true },
       },
     },
+    orderBy: { username: "asc" },
+    take: MAX_SEARCH_RESULTS,
   });
   return res.json(users);
-}
-
-async function updateProfile(req, res) {
-  const user = await prisma.user.update({
-    where: { id: req.user.id },
-    data: {
-      name: req.body.name,
-      bio: req.user.bio,
-      picture: req.body.picture,
-    },
-  });
-  return res.json(user);
 }
 
 async function getUserInfo(req, res) {
   const user = await prisma.user.findUnique({
     where: { id: req.user.id },
-    select: {
-      name: true,
-      username: true,
-      picture: true,
-      bio: true,
-    },
+    select: PUBLIC_USER_FIELDS,
   });
   return res.json(user);
 }
 
-async function updateUserInfo(req, res) {
-  const user = await prisma.user.update({
-    where: { id: req.user.id },
-    data: {
-      name: req.body.name,
-      username: req.body.username,
-      picture: req.body.picture,
-      bio: req.body.bio,
-    },
-  });
-  return res.json(user);
-}
+const updateUserInfo = [
+  validateProfile,
+  async (req, res) => {
+    const { name, username, picture, bio } = matchedData(req);
+    const data = { name, username };
+    // Optional fields change only when sent; an empty value clears them.
+    if ("picture" in req.body) data.picture = picture || null;
+    if ("bio" in req.body) data.bio = bio || null;
+    try {
+      const user = await prisma.user.update({
+        where: { id: req.user.id },
+        data,
+        select: PUBLIC_USER_FIELDS,
+      });
+      return res.json(user);
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        return sendError(res, 409, "Username already in use");
+      }
+      throw err;
+    }
+  },
+];
 
 module.exports = {
   signUpPost,
   loginPost,
   createMessage,
+  deleteMessage,
   createConversation,
   getOneConversation,
   getAllConversations,
   addToConversation,
-  removeFromConversation,
   getFriends,
   getPendingRequests,
   sendFriendRequest,
   acceptFriendRequest,
   removeFriend,
   searchUsers,
-  updateProfile,
   getUserInfo,
   updateUserInfo,
 };

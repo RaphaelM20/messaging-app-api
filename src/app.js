@@ -5,13 +5,25 @@ const LocalStrategy = require("passport-local").Strategy;
 const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const { Strategy: JwtStrategy, ExtractJwt } = require("passport-jwt");
-const jwt = require("jsonwebtoken");
 const routes = require("./routes");
+
+if (!process.env.JWT_SECRET) {
+  throw new Error("JWT_SECRET must be set");
+}
 
 const app = express();
 
-app.use(express.json());
-app.use(cors());
+// Comma-separated allow-list, e.g. "https://raphs-messaging-app.netlify.app".
+// Unset allows any origin (auth is by bearer token, not cookies).
+const allowedOrigins = process.env.CORS_ORIGIN?.split(",").map((o) => o.trim());
+
+app.use(express.json({ limit: "20kb" }));
+// Express 5 leaves req.body undefined when no JSON body was sent.
+app.use((req, res, next) => {
+  req.body ??= {};
+  next();
+});
+app.use(cors(allowedOrigins ? { origin: allowedOrigins } : undefined));
 app.use(passport.initialize());
 
 //routes
@@ -67,9 +79,30 @@ passport.use(
   }),
 );
 
-app.listen(3000, (error) => {
+app.use((req, res) => {
+  res.status(404).json({ errors: [{ msg: "Not found" }] });
+});
+
+// Express 5 forwards rejected async handlers here. Respond with JSON and
+// never leak internals to the client.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({ errors: [{ msg: "Invalid JSON body" }] });
+  }
+  if (err.type === "entity.too.large") {
+    return res
+      .status(413)
+      .json({ errors: [{ msg: "Request body too large" }] });
+  }
+  console.error(err);
+  res.status(500).json({ errors: [{ msg: "Something went wrong" }] });
+});
+
+const port = Number(process.env.PORT) || 3000;
+app.listen(port, (error) => {
   if (error) {
     throw error;
   }
-  console.log("app listening on port 3000!");
+  console.log(`app listening on port ${port}!`);
 });
