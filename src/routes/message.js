@@ -9,4 +9,10 @@ router.post(
   indexController.createMessage,
 );
 
+router.delete(
+  "/conversations/:conversationId/messages/:messageId",
+  passport.authenticate("jwt", { session: false }),
+  indexController.deleteMessage,
+);
+
 module.exports = router;
