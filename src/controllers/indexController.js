@@ -7,6 +7,8 @@ const jwt = require("jsonwebtoken");
 const MAX_GROUP_MEMBERS = 10;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_SEARCH_RESULTS = 20;
+// Shared public demo account; everyone who clicks "Continue as guest" uses it.
+const GUEST_USERNAME = "guest";
 
 // Never select the password hash into a response.
 const PUBLIC_USER_FIELDS = {
@@ -311,6 +313,11 @@ async function createMessage(req, res) {
 }
 
 async function deleteMessage(req, res) {
+  // Visitors share the guest account, so one could wipe the demo chats.
+  if (req.user.username === GUEST_USERNAME) {
+    return sendError(res, 403, "The guest account can't delete messages");
+  }
+
   const conversationId = parseId(req.params.conversationId);
   const messageId = parseId(req.params.messageId);
 
