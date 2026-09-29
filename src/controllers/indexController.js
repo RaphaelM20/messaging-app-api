@@ -51,6 +51,13 @@ function findMemberConversation(conversationId, userId, options = {}) {
   });
 }
 
+// Everyone who clicks "Continue as guest" shares one account, so actions
+// that would change the demo for other visitors are refused.
+function blockGuest(msg) {
+  return (req, res, next) =>
+    req.user.username === GUEST_USERNAME ? sendError(res, 403, msg) : next();
+}
+
 function signToken(userId) {
   return jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: "1d" });
 }
@@ -312,35 +319,33 @@ async function createMessage(req, res) {
   return res.status(201).json(message);
 }
 
-async function deleteMessage(req, res) {
-  // Visitors share the guest account, so one could wipe the demo chats.
-  if (req.user.username === GUEST_USERNAME) {
-    return sendError(res, 403, "The guest account can't delete messages");
-  }
+const deleteMessage = [
+  blockGuest("The guest account can't delete messages"),
+  async (req, res) => {
+    const conversationId = parseId(req.params.conversationId);
+    const messageId = parseId(req.params.messageId);
 
-  const conversationId = parseId(req.params.conversationId);
-  const messageId = parseId(req.params.messageId);
+    const message =
+      conversationId &&
+      messageId &&
+      (await prisma.message.findFirst({
+        where: {
+          id: messageId,
+          conversationId,
+          conversation: { members: { some: { id: req.user.id } } },
+        },
+        select: { senderId: true },
+      }));
 
-  const message =
-    conversationId &&
-    messageId &&
-    (await prisma.message.findFirst({
-      where: {
-        id: messageId,
-        conversationId,
-        conversation: { members: { some: { id: req.user.id } } },
-      },
-      select: { senderId: true },
-    }));
+    if (!message) return sendError(res, 404, "Message not found");
+    if (message.senderId !== req.user.id) {
+      return sendError(res, 403, "You can only delete your own messages");
+    }
 
-  if (!message) return sendError(res, 404, "Message not found");
-  if (message.senderId !== req.user.id) {
-    return sendError(res, 403, "You can only delete your own messages");
-  }
-
-  await prisma.message.delete({ where: { id: messageId } });
-  return res.status(204).end();
-}
+    await prisma.message.delete({ where: { id: messageId } });
+    return res.status(204).end();
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Friends
@@ -488,6 +493,7 @@ async function getUserInfo(req, res) {
 }
 
 const updateUserInfo = [
+  blockGuest("The guest account's profile can't be changed"),
   validateProfile,
   async (req, res) => {
     const { name, username, picture, bio } = matchedData(req);
